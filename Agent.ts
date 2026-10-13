@@ -39,7 +39,7 @@ const PERMISSIONS = {
 };
 
 // 本轮运行要收集的指标
-const stats = { turns: 0, prompt_tokens: 0, completion_tokens: 0, reason: "unknown", compactions: [] };
+const stats = { turns: 0, prompt_tokens: 0, completion_tokens: 0, reason: "unknown", compactions: [], turns_detail: [] };
 // ─────────────────────────────────────────────────────────────────────
 
 
@@ -335,6 +335,25 @@ async function chat(messages, useTools = true) {
         await sleep(wait);
     }
 }
+// 把一次工具调用压成一行，记进账本。参数里最占地方的是文件内容，
+// 那部分记成字数就行 —— 我们要看的是"读了哪个文件、回了多少字符"，
+// 不是内容本身。
+function briefTool(name, args) {
+    // 记账代码在 try/catch 外面 —— 它自己不能抛错，否则会把整轮任务搞崩。
+    // 模型传 "null" 或者非对象参数时，args 可能不是对象。
+    if (!args || typeof args !== "object") args = {};
+    const oneLine = (s) => truncate(String(s ?? ""), 80).replace(/\s+/g, " ");
+    if (name === "run_command") return `${name}(${oneLine(args.command)})`;
+    if (name === "edit") {
+        const from = String(args.old_string ?? "").split("\n").length;
+        const to = String(args.new_string ?? "").split("\n").length;
+        return `${name}(${args.path} ${from}行→${to}行)`;
+    }
+    if (name === "write_file") return `${name}(${args.path} ${String(args.content ?? "").length}字符)`;
+    if (name === "read_file") return `${name}(${args.path})`;
+    return `${name}(${oneLine(JSON.stringify(args))})`;
+}
+
 async function runAgent(messages) {
     let step = 0;
     const max_steps = MAX_STEPS;
@@ -343,12 +362,18 @@ async function runAgent(messages) {
         step++;
         stats.turns++;
 
+        // 本轮账本。只记总数的话，看到"这轮花了 39k、走了 8 步"也不知道多出来的花在哪；
+        // 记成每轮一行，才看得出上下文什么时候被压、压完又涨回来多少、有没有重复读同一个文件。
+        const rec = { turn: step, ctx: lastPromptTokens, compacted: false, tools: [] };
+        stats.turns_detail.push(rec);
+
         // 每轮开跑之前先量一次上下文。放在循环【里面】而不是循环后 ——
         // 否则一个 10 步的长任务从头到尾都不会压缩，一路涨到爆。
         // 用的是上一轮返回的真实 prompt_tokens，所以判断滞后一轮，够用。
         if (lastPromptTokens > MAX_PROMPT_TOKENS) {
             await compact(messages);
             lastPromptTokens = 0;   // 刚压过，别拿旧数字再判一次（否则每轮都白压一回）
+            rec.compacted = true;
         }
 
         const data = await chat(messages);
@@ -397,6 +422,8 @@ async function runAgent(messages) {
                 result = `工具执行失败：${err instanceof Error ? err.message : String(err)}`;
             }
 
+            // 记下"调了什么、拿回来多少字符" —— 后者才是撑爆上下文的主角
+            rec.tools.push(`${briefTool(name, args)} → ${String(result).length}字符`);
             messages.push({ role: "tool", tool_call_id: tool_call.id, content: result });
         }
     }
