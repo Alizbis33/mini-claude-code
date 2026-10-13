@@ -1,0 +1,11 @@
+# 密钥：永远不进版本库
+.env
+.env.local
+
+# 依赖
+node_modules/
+.npm-cache/
+
+# 运行时产物
+*.log
+tmp/
