@@ -12,6 +12,13 @@ const KEEP_ROUNDS = 2;
 const KEEP_TOOL_OUTPUTS = 3;   // 压缩时，最近这几条工具输出保持原样，更早的换成占位符
 const SQUASHED = "[早期工具输出已省略 —— 需要的话请重新读取]";
 const TRIM_IF_SHORTER_THAN = 2000;  // 中间过程短于此就直接裁掉，不值得为它花一次模型调用
+
+// 单次任务最多几轮。可用 AGENT_MAX_STEPS 覆盖 —— 想验证"是不是步数不够用"很方便。
+const MAX_STEPS = Number(process.env.AGENT_MAX_STEPS || 30);
+// API 重试：网络抖动 / 限流 / 5xx 都算临时故障，退避重试；其余 4xx 直接抛，重试无意义。
+const RETRY_MAX = Number(process.env.AGENT_RETRY || 3);
+const RETRY_BASE_MS = 500;            // 退避基数：500ms → 1s → 2s
+const REQUEST_TIMEOUT_MS = 120000;    // 单次请求超时 2 分钟
 const SYSTEM_PROMPT =
     "你是一个运行在用户终端里的编程助手，可以读写文件。" +
     "请用中文回答，简洁准确，不要自称是其他公司的模型。";
@@ -28,6 +35,7 @@ const PERMISSIONS = {
     read_file: "allow",
     write_file: AUTO ? "allow" : "ask",
     run_command: AUTO ? "allow" : "ask",
+    edit: AUTO ? "allow" : "ask",
 };
 
 // 本轮运行要收集的指标
@@ -135,6 +143,64 @@ const tools = {
         },
 
     },
+    edit: {
+        description: "把文件里的 old_string 替换成 new_string。old_string 必须在文件里【有且仅有一处】，" +
+                     "否则会被拒绝 —— 这是为了防止改错地方。要改多行就把整段旧内容原样抄进去。" +
+                     "只改一小部分时用它，不要用 write_file 重写整个文件。",
+        parameters: {
+            type: "object",
+            properties: {
+                path: { type: "string", description: "要修改的文件路径" },
+                old_string: {
+                    type: "string",
+                    description: "要被替换掉的原文。必须和文件内容逐字符一致（空格、缩进、换行都要对上），且在文件中只出现一次"
+                },
+                new_string: { type: "string", description: "替换成的新内容" },
+            },
+            required: ["path", "old_string", "new_string"]
+        },
+        handler(args) {
+            const file = safePath(args.path);
+            const before = fs.readFileSync(file, "utf8");
+            const oldStr = args.old_string ?? "";
+            const newStr = args.new_string ?? "";
+
+            if (oldStr === "") {
+                throw new Error("old_string 不能为空");
+            }
+            if (oldStr === newStr) {
+                return "old_string 和 new_string 一样，文件没有改动";
+            }
+
+            // 用 split 数出现次数。别只用 includes —— 那会把"匹配到多处"的情况藏起来，
+            // 结果就是悄悄改了错误的那一处。
+            const parts = before.split(oldStr);
+            const hits = parts.length - 1;
+
+            if (hits === 0) {
+                throw new Error("在文件里找不到 old_string。请先 read_file 看一眼原文，"
+                    + "注意空白和缩进要逐字符一致（最好连带前后几行一起抄进来）");
+            }
+            if (hits > 1) {
+                throw new Error(`old_string 在文件里出现了 ${hits} 次，无法确定该改哪一处。`
+                    + "请多带几行上下文，让它变得唯一");
+            }
+
+            fs.writeFileSync(file, parts.join(newStr), "utf8");
+
+            const lines = oldStr.split("\n").length;
+            const newLines = newStr.split("\n").length;
+            return `已修改 ${args.path}（替换 ${lines} 行 → ${newLines} 行）`;
+        },
+        preview(args) {
+            const oldStr = args.old_string ?? "";
+            const newStr = args.new_string ?? "";
+            const head = oldStr.split("\n").slice(0, 5).join("\n");
+            return `修改文件：${args.path}\n`
+                + `    ${oldStr.split("\n").length} 行 → ${newStr.split("\n").length} 行\n`
+                + `    将被替换掉的原文开头：\n${head}`;
+        },
+    },
     run_command: {
         description: "在项目目录下执行 shell 命令。注意：Windows 环境下实际是 cmd.exe，不是 bash；" +
                      "请使用 cmd 语法（dir / del / type / set /a），不要用 ls / rm / echo $((...)) 等 bash 语法。",
@@ -204,6 +270,8 @@ function trimMessages(messages) {
     return [messages[0], messages[1], ...messages.slice(cut)];
 }
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 async function chat(messages, useTools = true) {
 
     if (!QUIET) console.log(messages.length);
@@ -219,32 +287,57 @@ async function chat(messages, useTools = true) {
         } : {}),
     };
 
-    const response = await fetch(
-        "https://api.deepseek.com/chat/completions",
-        {
-            method: "POST",
-            headers: {
-                "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify(body),          // ← 用 body
+    // 网络抖动 / 限流 / 服务端 5xx 都是临时故障，退避重试即可；
+    // 其余 4xx 是我们自己的请求写错了，重试多少次都一样，直接抛。
+    for (let attempt = 1; ; attempt++) {
+        let err;
+        try {
+            const response = await fetch(
+                "https://api.deepseek.com/chat/completions",
+                {
+                    method: "POST",
+                    headers: {
+                        "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify(body),
+                    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),   // 别让一次请求挂死
+                }
+            );
+            const text = await response.text();
+
+            if (response.status === 429 || response.status >= 500) {
+                err = new Error(`API 错误 ${response.status}：${text.slice(0, 300)}`);
+                err.retryable = true;                    // 限流 / 服务端故障，值得再试
+            } else if (!response.ok) {
+                err = new Error(`API 错误 ${response.status}：${text.slice(0, 300)}`);
+                // 不标 retryable —— 请求本身有问题
+            } else {
+                const data = JSON.parse(text);
+                lastPromptTokens = data.usage.prompt_tokens;   // 记下来，供下一轮判断
+                stats.prompt_tokens += data.usage.prompt_tokens;
+                stats.completion_tokens += data.usage.completion_tokens;
+                if (!QUIET) console.log(" ->prompt_tokens:", lastPromptTokens);
+                return data;
+            }
+        } catch (e) {
+            // fetch 自己抛的错（连不上、DNS 失败、超时）也全是临时故障。
+            // 统一包成 Error，顺带保住原始错误在 cause 里，方便排查。
+            err = new Error(`请求失败：${e?.message ?? e}`);
+            err.cause = e;
+            err.retryable = true;
         }
-    );
 
-    const data = await response.json();
+        if (!err.retryable || attempt >= RETRY_MAX) throw err;
 
-    if (!response.ok) {
-        throw new Error(`API 错误 ${response.status}：${JSON.stringify(data)}`);
+        const wait = RETRY_BASE_MS * 2 ** (attempt - 1);   // 500ms → 1s → 2s
+        if (!QUIET) console.log(`[重试 ${attempt}/${RETRY_MAX - 1}] ${err.message} —— ${wait}ms 后再试`);
+        await sleep(wait);
     }
-    lastPromptTokens = data.usage.prompt_tokens;   // 记下来，供下一轮判断
-    stats.prompt_tokens += data.usage.prompt_tokens;
-    stats.completion_tokens += data.usage.completion_tokens;
-    if (!QUIET) console.log(" ->prompt_tokens:", lastPromptTokens);
-    return data;
 }
 async function runAgent(messages) {
     let step = 0;
-    const max_steps = 10;
+    const max_steps = MAX_STEPS;
     let answer = null;
     while (step < max_steps) {
         step++;
