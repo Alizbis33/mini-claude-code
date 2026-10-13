@@ -9,3 +9,10 @@ node_modules/
 # 运行时产物
 *.log
 tmp/
+
+# Obsidian 的窗口布局：每开一次就变一次，进版本库只会天天产生假 diff
+# （app.json / appearance.json / core-plugins.json 是真正的设置，留着）
+#   注意 **/ —— 中间带斜杠的模式会锚定到仓库根目录，写 ".obsidian/xxx"
+#   匹配不到 1/.obsidian/xxx 那一层
+**/.obsidian/workspace.json
+**/.obsidian/workspace-mobile.json
