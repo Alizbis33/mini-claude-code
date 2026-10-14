@@ -16,3 +16,16 @@ tmp/
 #   匹配不到 1/.obsidian/xxx 那一层
 **/.obsidian/workspace.json
 **/.obsidian/workspace-mobile.json
+
+# 个人笔记库：本地保留，不进版本库
+1/
+
+# 个人文档：设计笔记 + 学习笔记（本地保留）
+DESIGN.md
+NOTES.md
+
+# VS Code 工作区配置（含本地路径）
+*.code-workspace
+
+# 求职材料
+简历-草稿.md
